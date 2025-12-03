@@ -1,157 +1,232 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import pandas as pd
+from pathlib import Path
 
-# ここに設定する数字を変えると、簡単にルールを調整できるよ
-SHORT_WINDOW = 20  # 短い期間の本数（短期の移動平均）
-LONG_WINDOW = 60   # 長い期間の本数（長期の移動平均）
-INITIAL_CAPITAL = 10000.0  # スタートのおこづかい（円）
-FEE_RATE = 0.00002  # 手数料率（0.002% = 0.00002）
-TRADE_SIZE = 1  # 1回に買う量。ここでは1単位で固定。
+# =========================================================
+# パラメータ（ここだけいじれば戦略を調整できる）
+# =========================================================
+DEFAULT_PARAMS = {
+    "short_window": 20,       # 短期移動平均の本数
+    "long_window": 60,        # 長期移動平均の本数
+    "initial_capital": 10000, # 初期資金（円）
+    "fee_rate": 0.00002,      # 片道手数料率（0.002% = 0.00002）
+    "trade_size": 1,          # 1トレードあたりの数量（ここでは 1 万通貨みたいなイメージ）
+}
 
-# CSVファイルの場所（リポジトリのルートにある）
+# バックテストに使う CSV ファイル
 CSV_PATH = "usdjpy_yahoo_30d_5m.csv"
 
+# トレード一覧出力先
+TRADES_CSV = "trades_latest.csv"
 
+
+# =========================================================
+# データ読み込み
+# =========================================================
 def load_price_data(path: str) -> pd.DataFrame:
-    """CSVからデータを読み込み、きれいに整える関数。"""
-    # Yahoo Finance の CSV は先頭に余計な行があるので 2 行スキップする
+    """CSV からデータを読み込んで、きれいに整える。"""
+
     df = pd.read_csv(
         path,
-        skiprows=2,
+        skiprows=2,  # 先頭2行はメタ情報なのでスキップ
         names=["Datetime", "Close", "High", "Low", "Open", "Volume"],
     )
 
-    # 文字列の両端の空白を削る(" Datetime " みたいなケース対策)
-    df["Datetime"] = df["Datetime"].astype(str).str.strip()
-
-    # 明らかにゴミな行("Datetime" や "Ticker" など)を先に落とす
-    df = df[~df["Datetime"].isin(["Datetime", "Ticker", ""])]
-
-    # 文字の時間を日時データに変換(変換できないものは NaT にして後で落とす)
+    # 文字の時間を datetime 型に変換（変換できないものは NaT）
     df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
 
-    # NaT(変換に失敗した行)を削除
+    # 日付に変換できなかった行を捨てる
     df = df.dropna(subset=["Datetime"])
 
-    # 時間順(古い → 新しい)に並び替える
+    # 時間順（古い → 新しい）に並べ直す
     df = df.sort_values("Datetime").reset_index(drop=True)
-
-    # 短期と長期の単純移動平均(SMA)を計算する
-    df["sma_short"] = df["Close"].rolling(window=SHORT_WINDOW).mean()
-    df["sma_long"]  = df["Close"].rolling(window=LONG_WINDOW).mean()
 
     return df
 
 
+# =========================================================
+# 最大ドローダウン計算
+# =========================================================
 def calculate_max_drawdown(equity_curve):
-    """資産曲線から最大ドローダウンを計算するよ。"""
+    """資産曲線から最大ドローダウン（マイナスの割合）を計算する。"""
     max_peak = 0
-    max_dd = 0
+    max_dd = 0.0
     for eq in equity_curve:
         max_peak = max(max_peak, eq)
         if max_peak > 0:
             dd = (eq - max_peak) / max_peak
             max_dd = min(max_dd, dd)
-    return max_dd
+    return max_dd  # 例: -0.0159 → -1.59%
 
 
-def backtest(df: pd.DataFrame):
-    """移動平均クロスのバックテストをするメインの関数。"""
-    cash = INITIAL_CAPITAL  # 現金（お財布の中身）
-    position_price = None  # 今持っているポジションの買値
-    trades = 0  # 完了したトレード回数
-    wins = 0  # 勝ちトレードの回数
-    equity_curve = []  # 時間ごとの資産の記録（ドローダウン用）
+# =========================================================
+# バックテスト本体
+# =========================================================
+def backtest(params: dict, price_df: pd.DataFrame):
+    """
+    移動平均クロスでロングだけするシンプル戦略。
+    params: パラメータ dict
+    price_df: load_price_data() で読み込んだ DataFrame
+    """
+    df = price_df.copy()
 
-    for i in range(1, len(df)):
-        row_prev = df.iloc[i - 1]
+    short_w = int(params["short_window"])
+    long_w = int(params["long_window"])
+    fee = float(params["fee_rate"])
+    size = float(params["trade_size"])
+    initial_capital = float(params["initial_capital"])
+
+    # 短期・長期 SMA を計算
+    df["sma_short"] = df["Close"].rolling(window=short_w).mean()
+    df["sma_long"] = df["Close"].rolling(window=long_w).mean()
+
+    # SMA が計算できない最初の方は捨てる
+    df = df.dropna(subset=["sma_short", "sma_long"]).reset_index(drop=True)
+
+    cash = initial_capital
+    position = 0.0  # 0 or size
+    entry_price = 0.0
+    entry_time = None
+
+    equity_curve = []
+    trades = []
+
+    for i in range(len(df)):
         row = df.iloc[i]
+        price = float(row["Close"])
+        now = row["Datetime"]
 
-        # 移動平均が計算できていない最初のころはスキップ
-        if pd.isna(row_prev["sma_short"]) or pd.isna(row_prev["sma_long"]) or pd.isna(row["sma_short"]) or pd.isna(row["sma_long"]):
-            # 資産の記録だけは進める
-            current_price = row["Close"]
-            current_equity = cash
-            if position_price is not None:
-                current_equity += (current_price - position_price) * TRADE_SIZE
-            equity_curve.append(current_equity)
-            continue
+        # 1本前と現在の SMA でクロス判定
+        if i == 0:
+            signal = 0
+        else:
+            prev = df.iloc[i - 1]
+            prev_short = float(prev["sma_short"])
+            prev_long = float(prev["sma_long"])
+            cur_short = float(row["sma_short"])
+            cur_long = float(row["sma_long"])
 
-        short_prev = row_prev["sma_short"]
-        long_prev = row_prev["sma_long"]
-        short_now = row["sma_short"]
-        long_now = row["sma_long"]
-        price = row["Close"]
+            if prev_short <= prev_long and cur_short > cur_long:
+                signal = 1   # ゴールデンクロス → 買い
+            elif prev_short >= prev_long and cur_short < cur_long:
+                signal = -1  # デッドクロス → 手仕舞い
+            else:
+                signal = 0
 
-        # シグナル：短期が長期を下から上に抜けたら買い
-        buy_signal = short_prev <= long_prev and short_now > long_now
-        # シグナル：短期が長期を上から下に抜けたら決済
-        sell_signal = short_prev >= long_prev and short_now < long_now
+        # ===== 手仕舞い（ロングを持っていて、売りシグナル） =====
+        if position > 0 and signal == -1:
+            # 売り決済（成行でクローズ）
+            cash += price * size              # 売り代金
+            cash -= price * size * fee        # 手数料
 
-        # 買うタイミング
-        if position_price is None and buy_signal:
-            fee = price * TRADE_SIZE * FEE_RATE
-            cash -= price * TRADE_SIZE  # 買ったぶんお金が減る
-            cash -= fee  # 手数料を払う
-            position_price = price  # 買った価格をメモ
+            pnl = (price - entry_price) * size - (
+                entry_price * size * fee + price * size * fee
+            )
 
-        # 売って終わるタイミング
-        elif position_price is not None and sell_signal:
-            fee = price * TRADE_SIZE * FEE_RATE
-            cash += price * TRADE_SIZE  # 売ってお金が戻る
-            cash -= fee  # 手数料を払う
-            profit = (price - position_price) * TRADE_SIZE - fee
-            trades += 1
-            if profit > 0:
-                wins += 1
-            position_price = None
+            trades.append(
+                {
+                    "entry_time": entry_time,
+                    "exit_time": now,
+                    "direction": "LONG",
+                    "entry_price": entry_price,
+                    "exit_price": price,
+                    "pnl": pnl,
+                    "equity_after": cash,
+                }
+            )
 
-        # 現在の資産（現金＋含み益/損）を記録
-        current_equity = cash
-        if position_price is not None:
-            current_equity += (price - position_price) * TRADE_SIZE
-        equity_curve.append(current_equity)
+            position = 0.0
+            entry_price = 0.0
+            entry_time = None
 
-    # データの最後まで来たときにまだポジションがあれば、最後の価格で決済して結果を出す
-    if position_price is not None:
-        price = df.iloc[-1]["Close"]
-        fee = price * TRADE_SIZE * FEE_RATE
-        cash += price * TRADE_SIZE
-        cash -= fee
-        profit = (price - position_price) * TRADE_SIZE - fee
-        trades += 1
-        if profit > 0:
-            wins += 1
-        position_price = None
-        # 決済後の資産も記録
-        equity_curve.append(cash)
+        # ===== 新規エントリー（ポジションなし & 買いシグナル） =====
+        if position == 0 and signal == 1:
+            entry_price = price
+            entry_time = now
 
-    # 最終的な数字を計算
-    final_balance = cash
-    win_rate = wins / trades if trades > 0 else 0.0
+            cash -= price * size              # 買い代金
+            cash -= price * size * fee        # 手数料
+            position = size
+
+        # 毎バーの評価額
+        equity = cash + position * price
+        equity_curve.append(equity)
+
+    # バックテスト終了時点でポジションが残っている場合は、そのまま評価額に含めるだけ
+    final_balance = equity_curve[-1] if equity_curve else initial_capital
     max_dd = calculate_max_drawdown(equity_curve)
 
-    return {
+    # 成績集計
+    wins = [t for t in trades if t["pnl"] > 0]
+    win_rate = (len(wins) / len(trades) * 100.0) if trades else 0.0
+
+    result = {
         "final_balance": final_balance,
-        "trades": trades,
-        "win_rate": win_rate,
         "max_drawdown": max_dd,
+        "win_rate": win_rate,
+        "trade_count": len(trades),
+        "equity_curve": equity_curve,
+        "trades": trades,
     }
+    return result
 
 
+# =========================================================
+# トレード一覧を CSV に保存
+# =========================================================
+def save_trades_to_csv(trades, path: str = TRADES_CSV):
+    if not trades:
+        print("※ トレードが 0 件なので、CSV は保存しません。")
+        return
+
+    df_trades = pd.DataFrame(trades)
+    df_trades.to_csv(path, index=False, encoding="utf-8")
+    print(f"トレード一覧を保存しました: {path}")
+
+
+# =========================================================
+# GA 用の評価関数（今はメモ程度に使う）
+# =========================================================
+def evaluate_params(params: dict, price_df: pd.DataFrame) -> float:
+    """
+    GA から呼び出す想定の評価関数。
+    入力: params dict
+    出力: スコア（大きいほど良い）
+    """
+    result = backtest(params, price_df)
+    final_balance = result["final_balance"]
+    max_dd = result["max_drawdown"]  # マイナス値
+
+    # シンプルに「最終残高 - ドローダウンにペナルティをかけたもの」
+    fitness = final_balance + max_dd * 10000  # DD が -0.02 なら -200 のペナルティ
+    return float(fitness)
+
+
+# =========================================================
+# メイン
+# =========================================================
 def main():
-    # データを読み込む
-    df = load_price_data(CSV_PATH)
+    # データ読み込み
+    price_df = load_price_data(CSV_PATH)
 
-    # バックテストを実行
-    results = backtest(df)
+    # デフォルトパラメータでバックテスト
+    result = backtest(DEFAULT_PARAMS, price_df)
 
-    # 結果をわかりやすく表示
+    # トレード一覧を CSV に書き出し
+    save_trades_to_csv(result["trades"])
+
+    # コンソールに成績表示
     print("===== バックテスト結果 =====")
-    print(f"最終口座残高: {results['final_balance']:.2f} 円")
-    print(f"トレード回数: {results['trades']}")
-    print(f"勝率: {results['win_rate'] * 100:.2f}%")
-    # 最大ドローダウンはマイナスの割合で返ってくるので、%表示にする
-    print(f"最大ドローダウン: {results['max_drawdown'] * 100:.2f}%")
+    print(f"最終口座残高: {result['final_balance']:.2f} 円")
+    print(f"トレード回数: {result['trade_count']}")
+    print(f"勝率: {result['win_rate']:.2f}%")
+    print(f"最大ドローダウン: {result['max_drawdown'] * 100:.2f}%")
+
+    # おまけ：評価関数のスコアも表示（GA 用の確認）
+    score = evaluate_params(DEFAULT_PARAMS, price_df)
+    print(f"評価関数のスコア: {score:.2f}")
 
 
 if __name__ == "__main__":
