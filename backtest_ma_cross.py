@@ -12,23 +12,32 @@ CSV_PATH = "usdjpy_yahoo_30d_5m.csv"
 
 
 def load_price_data(path: str) -> pd.DataFrame:
-    """CSVからデータを読み込み、きれいに整える関数。"""
-    # Yahoo FinanceのCSVは先頭に余計な行があるので2行スキップするよ
+    """CSVからデータを読み込み、きれいに整える関数。"""
+    # Yahoo Finance の CSV は先頭に余計な行があるので 2 行スキップする
     df = pd.read_csv(
         path,
         skiprows=2,
         names=["Datetime", "Close", "High", "Low", "Open", "Volume"],
     )
 
-    # 文字の時間を日時データに変換
-    df["Datetime"] = pd.to_datetime(df["Datetime"])
+    # 文字列の両端の空白を削る(" Datetime " みたいなケース対策)
+    df["Datetime"] = df["Datetime"].astype(str).str.strip()
 
-    # 時間順（古い → 新しい）に並び替える
+    # 明らかにゴミな行("Datetime" や "Ticker" など)を先に落とす
+    df = df[~df["Datetime"].isin(["Datetime", "Ticker", ""])]
+
+    # 文字の時間を日時データに変換(変換できないものは NaT にして後で落とす)
+    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce")
+
+    # NaT(変換に失敗した行)を削除
+    df = df.dropna(subset=["Datetime"])
+
+    # 時間順(古い → 新しい)に並び替える
     df = df.sort_values("Datetime").reset_index(drop=True)
 
-    # 短期と長期の単純移動平均（SMA）を計算する
+    # 短期と長期の単純移動平均(SMA)を計算する
     df["sma_short"] = df["Close"].rolling(window=SHORT_WINDOW).mean()
-    df["sma_long"] = df["Close"].rolling(window=LONG_WINDOW).mean()
+    df["sma_long"]  = df["Close"].rolling(window=LONG_WINDOW).mean()
 
     return df
 
