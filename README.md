@@ -46,3 +46,41 @@ FX 自動売買のためのコードを置く場所
 
 `backtest_ma_cross.py` は同じフォルダにある `usdjpy_yahoo_30d_5m.csv` を読み込む前提なので、
 ファイル名や場所を変えずに使ってください。
+
+## Pythonista での実行方法
+
+iPhone / iPad の Pythonista 3 だけで、バックテストを実行できます。
+
+1. Pythonista を開き、「This iPhone」フォルダを開く  
+2. `sync_github.py` を実行して、GitHub から最新ファイルを取得する  
+3. 取得が終わったら、`backtest_ma_cross.py` を開く  
+4. 右上の ▶ ボタンをタップして実行  
+
+コンソールに次の情報が表示されます。
+
+- 最終口座残高  
+- トレード回数  
+- 勝率  
+- 最大ドローダウン  
+
+同時に、同じフォルダに `trades_latest.csv` が出力され、
+1トレードごとのエントリー・エグジット・損益が確認できます。
+
+---
+
+## sync_github.py の使い方
+
+`sync_github.py` は、GitHub の `fx-systemtrade` リポジトリと
+Pythonista のローカルフォルダを同期するためのシンプルなスクリプトです。
+
+1. スクリプト内の `BASE_URL` が自分の GitHub リポジトリ
+   (`https://raw.githubusercontent.com/ユーザー名/fx-systemtrade/main/`) を
+   指していることを確認する  
+2. `FILES = [...]` に、同期したいファイル名を列挙する  
+   例:
+   ```python
+   FILES = [
+       "backtest_ma_cross.py",
+       "download_usdjpy_yahoo.py",
+       "README.md",
+   ]
